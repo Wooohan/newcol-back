@@ -1,0 +1,253 @@
+import express from 'express';
+import { query } from '../services/db.js';
+import logger from '../utils/logger.js';
+
+const router = express.Router();
+
+/**
+ * Generic CRUD relay — replaces the old Vercel serverless /api/db endpoint.
+ * The frontend sends { action, collection, filter?, update? }.
+ */
+router.post('/db', async (req, res) => {
+  const { action, collection, filter, update } = req.body;
+  const table = collection || 'provisioning_logs';
+
+  try {
+    switch (action) {
+      case 'ping': {
+        const probe = await query('SELECT 1');
+        return res.json({ ok: true, status: 200, schemaReady: true, details: 'Handshake successful' });
+      }
+
+      case 'find': {
+        let sql, params;
+        if (filter?.id) {
+          sql = `SELECT * FROM "${table}" WHERE id = $1`;
+          params = [filter.id];
+        } else {
+          sql = `SELECT * FROM "${table}"`;
+          params = [];
+        }
+        const result = await query(sql, params);
+        return res.json({ documents: result.rows });
+      }
+
+      case 'updateOne': {
+        const payload = update?.$set || {};
+        if (!payload.id) {
+          return res.status(400).json({ error: 'Missing id in payload' });
+        }
+
+        const columns = Object.keys(payload);
+        const values = Object.values(payload);
+        const placeholders = columns.map((_, i) => `$${i + 1}`);
+        const updateSet = columns.map((col, i) => `"${col}" = $${i + 1}`).join(', ');
+
+        const sql = `
+          INSERT INTO "${table}" (${columns.map(c => `"${c}"`).join(', ')})
+          VALUES (${placeholders.join(', ')})
+          ON CONFLICT (id) DO UPDATE SET ${updateSet}
+          RETURNING id
+        `;
+
+        const result = await query(sql, values);
+        return res.json({ ok: true, upsertedId: result.rows[0]?.id });
+      }
+
+      case 'deleteOne': {
+        if (!filter?.id) {
+          return res.status(400).json({ error: 'Missing filter.id' });
+        }
+        await query(`DELETE FROM "${table}" WHERE id = $1`, [filter.id]);
+        return res.json({ ok: true });
+      }
+
+      case 'deleteMany': {
+        await query(`DELETE FROM "${table}"`);
+        return res.json({ ok: true });
+      }
+
+      case 'listCollections': {
+        const tables = ['agents', 'pages', 'conversations', 'messages', 'links', 'media', 'provisioning_logs'];
+        const stats = await Promise.all(
+          tables.map(async (t) => {
+            try {
+              const result = await query(`SELECT COUNT(*) as count FROM "${t}"`);
+              return { name: t, exists: true, count: parseInt(result.rows[0].count) };
+            } catch {
+              return { name: t, exists: false, count: 0 };
+            }
+          })
+        );
+        return res.json({ ok: true, collections: stats });
+      }
+
+      default:
+        return res.status(400).json({ error: 'Invalid operation' });
+    }
+  } catch (error) {
+    logger.error(`DB operation [${action}] on [${table}] failed:`, error.message);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Sync recent conversations from FB
+ */
+router.post('/sync-conversations', async (req, res) => {
+  try {
+    const { pageId, limit = 5 } = req.body;
+    if (!pageId) return res.status(400).json({ error: 'pageId is required' });
+
+    const result = await query(
+      `SELECT * FROM conversations WHERE "pageId" = $1 ORDER BY "lastTimestamp" DESC LIMIT $2`,
+      [pageId, limit]
+    );
+    res.json({ conversations: result.rows });
+  } catch (error) {
+    logger.error('Error syncing conversations:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Get messages for a conversation
+ */
+router.get('/messages/:conversationId', async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const result = await query(
+      `SELECT * FROM messages WHERE "conversationId" = $1 ORDER BY timestamp ASC`,
+      [conversationId]
+    );
+    res.json({ messages: result.rows });
+  } catch (error) {
+    logger.error('Error fetching messages:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Send message — stores in DB + emits via Socket.IO + calls Facebook API
+ */
+router.post('/send-message', async (req, res) => {
+  try {
+    const { conversationId, text, senderId, senderName, customerId, pageAccessToken, isWindowExpired } = req.body;
+
+    if (!conversationId || !text) {
+      return res.status(400).json({ error: 'conversationId and text are required' });
+    }
+
+    const messageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const timestamp = new Date().toISOString();
+
+    // Store message in DB
+    await query(
+      `INSERT INTO messages (id, "conversationId", "senderId", "senderName", text, timestamp, "isIncoming", "isRead")
+       VALUES ($1, $2, $3, $4, $5, $6, false, true)`,
+      [messageId, conversationId, senderId || 'agent', senderName || 'Agent', text, timestamp]
+    );
+
+    // Update conversation's last message
+    await query(
+      `UPDATE conversations SET "lastMessage" = $1, "lastTimestamp" = $2 WHERE id = $3`,
+      [text, timestamp, conversationId]
+    );
+
+    const message = {
+      id: messageId,
+      conversationId,
+      senderId: senderId || 'agent',
+      senderName: senderName || 'Agent',
+      text,
+      timestamp,
+      isIncoming: false,
+      isRead: true,
+    };
+
+    // Call Facebook Send API if we have the token
+    let fbResponse = null;
+    if (customerId && pageAccessToken) {
+      try {
+        const fbUrl = `https://graph.facebook.com/v22.0/me/messages?access_token=${pageAccessToken}`;
+        const payload = {
+          recipient: { id: customerId },
+          message: { text },
+          messaging_type: isWindowExpired ? 'MESSAGE_TAG' : 'RESPONSE',
+        };
+        if (isWindowExpired) payload.tag = 'HUMAN_AGENT';
+
+        const fbRes = await fetch(fbUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        fbResponse = await fbRes.json();
+
+        if (fbResponse.error) {
+          logger.error('Facebook send error:', fbResponse.error);
+          return res.status(400).json({ error: fbResponse.error.message, fbError: fbResponse.error });
+        }
+      } catch (fbErr) {
+        logger.error('Facebook API call failed:', fbErr.message);
+        return res.status(500).json({ error: 'Facebook API call failed: ' + fbErr.message });
+      }
+    }
+
+    // Emit via Socket.IO (attached to req by middleware)
+    if (req.io) {
+      req.io.emit('new_message', message);
+      req.io.emit('conversation_updated', {
+        id: conversationId,
+        lastMessage: text,
+        lastTimestamp: timestamp,
+      });
+    }
+
+    logger.info('Message sent:', messageId);
+    res.json({ message, fbResponse });
+  } catch (error) {
+    logger.error('Error sending message:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Update conversation status
+ */
+router.patch('/conversations/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+    const keys = Object.keys(updates);
+    const values = Object.values(updates);
+
+    const setClause = keys.map((k, i) => `"${k}" = $${i + 2}`).join(', ');
+    const result = await query(
+      `UPDATE conversations SET ${setClause} WHERE id = $1 RETURNING *`,
+      [id, ...values]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    if (req.io) {
+      req.io.emit('conversation_updated', result.rows[0]);
+    }
+
+    res.json({ conversation: result.rows[0] });
+  } catch (error) {
+    logger.error('Error updating conversation:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * API health check
+ */
+router.get('/health', (_req, res) => {
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+export default router;
