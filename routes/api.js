@@ -244,6 +244,15 @@ router.patch('/conversations/:id', async (req, res) => {
 });
 
 /**
+ * Public config — returns non-secret values the frontend may need
+ */
+router.get('/config', (_req, res) => {
+  res.json({
+    fbAppId: process.env.FB_APP_ID || '',
+  });
+});
+
+/**
  * API health check
  */
 router.get('/health', (_req, res) => {
