@@ -244,6 +244,42 @@ router.patch('/conversations/:id', async (req, res) => {
 });
 
 /**
+ * Subscribe a page to app webhooks (called when page is connected)
+ */
+router.post('/subscribe-page', async (req, res) => {
+  try {
+    const { pageId, accessToken } = req.body;
+    if (!pageId || !accessToken) {
+      return res.status(400).json({ error: 'pageId and accessToken are required' });
+    }
+
+    const fbRes = await fetch(
+      `https://graph.facebook.com/v22.0/${pageId}/subscribed_apps`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subscribed_fields: 'messages,messaging_postbacks,message_deliveries,message_reads',
+          access_token: accessToken,
+        }),
+      }
+    );
+    const data = await fbRes.json();
+
+    if (data.success) {
+      logger.info(`Page ${pageId} subscribed to app webhooks`);
+      res.json({ ok: true });
+    } else {
+      logger.error(`Failed to subscribe page ${pageId}:`, data);
+      res.status(400).json({ error: data.error?.message || 'Subscription failed', details: data });
+    }
+  } catch (error) {
+    logger.error('Error subscribing page:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * Public config — returns non-secret values the frontend may need
  */
 router.get('/config', (_req, res) => {
